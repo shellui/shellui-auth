@@ -1,5 +1,8 @@
 asgiref==3.11.1
 Django==6.0.3
+django-filter==25.2
 djangorestframework==3.17.1
+drf-spectacular==0.29.0
+Markdown==3.10.2
 python-dotenv==1.2.2
 sqlparse==0.5.5

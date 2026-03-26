@@ -25,7 +25,7 @@ User = get_user_model()
 FRONTEND_DEFAULT_REDIRECT_PATH = '/login/callback'
 
 
-def _extract_user_data(provider: str, userinfo: dict, access_token: str) -> tuple[str, str, str]:
+def _extract_user_data(provider: str, userinfo: dict, access_token: str) -> tuple[str, str, str, str | None]:
     provider_id = str(
         userinfo.get('id')
         or userinfo.get('sub')
@@ -55,7 +55,11 @@ def _extract_user_data(provider: str, userinfo: dict, access_token: str) -> tupl
     if not full_name:
         full_name = email.split('@')[0]
 
-    return provider_id, email.lower(), full_name
+    avatar_url = userinfo.get('avatar_url') or userinfo.get('picture') or userinfo.get('photo')
+    if not isinstance(avatar_url, str) or not avatar_url.strip():
+        avatar_url = None
+
+    return provider_id, email.lower(), full_name, avatar_url
 
 
 def _issue_tokens(user: User) -> dict:
@@ -112,12 +116,12 @@ def _enabled_oauth_providers() -> list[str]:
     return configured
 
 
-def _issue_shellui_tokens(user: User, provider: str) -> dict:
+def _issue_shellui_tokens(user: User, provider: str, avatar_url: str | None = None) -> dict:
     refresh = RefreshToken.for_user(user)
     user_metadata = {
         'name': user.get_full_name() or user.get_username(),
         'full_name': user.get_full_name() or user.get_username(),
-        'avatar_url': None,
+        'avatar_url': avatar_url,
     }
     app_metadata = {'provider': provider}
     access = refresh.access_token
@@ -210,7 +214,7 @@ class SocialLoginView(APIView):
                 redirect_uri=serializer.validated_data['redirect_uri'],
             )
             userinfo = fetch_provider_userinfo(provider, access_token)
-            provider_id, email, full_name = _extract_user_data(provider, userinfo, access_token)
+            provider_id, email, full_name, _avatar_url = _extract_user_data(provider, userinfo, access_token)
         except Exception as exc:
             return Response(
                 {'detail': str(exc)},
@@ -301,7 +305,7 @@ class ShellUIOAuthCallbackView(APIView):
         try:
             access_token = exchange_code_for_token(provider=provider, code=code, redirect_uri=callback_url)
             userinfo = fetch_provider_userinfo(provider, access_token)
-            provider_id, email, full_name = _extract_user_data(provider, userinfo, access_token)
+            provider_id, email, full_name, avatar_url = _extract_user_data(provider, userinfo, access_token)
         except Exception as exc:
             return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -320,7 +324,16 @@ class ShellUIOAuthCallbackView(APIView):
                 user.last_name = ' '.join(full_name.split(' ')[1:])
             user.save(update_fields=['first_name', 'last_name'])
 
-        payload = _issue_shellui_tokens(user, provider=provider)
+        cache.set(
+            f"shellui:user_metadata:{user.id}",
+            {
+                'name': user.get_full_name() or user.get_username(),
+                'full_name': user.get_full_name() or user.get_username(),
+                'avatar_url': avatar_url,
+            },
+            timeout=60 * 60 * 24 * 30,
+        )
+        payload = _issue_shellui_tokens(user, provider=provider, avatar_url=avatar_url)
         return HttpResponseRedirect(_build_callback_redirect(redirect_to, payload, provider=provider))
 
 

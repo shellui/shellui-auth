@@ -101,6 +101,23 @@ def _resolve_avatar_url_for_jwt(user: User, explicit: str | None = None) -> str 
     return None
 
 
+def _resolve_auth_provider_for_jwt(
+    user: User,
+    oauth_provider: str | None = None,
+    prior_auth_provider: str | None = None,
+) -> str:
+    """OAuth callback provider wins; on refresh, keep prior JWT provider (e.g. github), not 'refresh'."""
+    for candidate in (oauth_provider, prior_auth_provider):
+        if isinstance(candidate, str) and candidate.strip():
+            p = candidate.strip().lower()
+            if p != 'refresh':
+                return p
+    account = SocialAccount.objects.filter(user=user).order_by('pk').first()
+    if account and getattr(account, 'provider', None):
+        return str(account.provider).lower()
+    return 'refresh'
+
+
 def _issue_tokens(user: User) -> dict:
     user_payload = {
         'id': user.id,
@@ -155,7 +172,13 @@ def _enabled_oauth_providers() -> list[str]:
     return configured
 
 
-def _issue_shellui_tokens(user: User, provider: str, avatar_url: str | None = None) -> dict:
+def _issue_shellui_tokens(
+    user: User,
+    avatar_url: str | None = None,
+    *,
+    oauth_provider: str | None = None,
+    prior_app_metadata: dict | None = None,
+) -> dict:
     refresh = RefreshToken.for_user(user)
     preferences = _user_preferences_payload(user)
     resolved_avatar = _resolve_avatar_url_for_jwt(user, avatar_url)
@@ -165,7 +188,14 @@ def _issue_shellui_tokens(user: User, provider: str, avatar_url: str | None = No
         'avatar_url': resolved_avatar,
         'shelluiPreferences': preferences,
     }
-    app_metadata = {'provider': provider}
+    app_meta_base = dict(prior_app_metadata) if isinstance(prior_app_metadata, dict) else {}
+    prior_provider = app_meta_base.get('provider') if isinstance(app_meta_base.get('provider'), str) else None
+    app_meta_base['provider'] = _resolve_auth_provider_for_jwt(
+        user,
+        oauth_provider=oauth_provider,
+        prior_auth_provider=prior_provider,
+    )
+    app_metadata = app_meta_base
     access = refresh.access_token
     access['email'] = user.email
     access['user_metadata'] = user_metadata
@@ -391,7 +421,7 @@ class ShellUIOAuthCallbackView(APIView):
             },
             timeout=60 * 60 * 24 * 30,
         )
-        payload = _issue_shellui_tokens(user, provider=provider, avatar_url=avatar_url)
+        payload = _issue_shellui_tokens(user, avatar_url=avatar_url, oauth_provider=provider)
         return HttpResponseRedirect(_build_callback_redirect(redirect_to, payload, provider=provider))
 
 
@@ -420,7 +450,12 @@ class ShellUITokenView(APIView):
         if isinstance(prior_meta, dict):
             prior_avatar = _normalize_avatar_url(prior_meta.get('avatar_url'))
 
-        payload = _issue_shellui_tokens(user, provider='refresh', avatar_url=prior_avatar)
+        prior_app = refresh.get('app_metadata')
+        payload = _issue_shellui_tokens(
+            user,
+            avatar_url=prior_avatar,
+            prior_app_metadata=prior_app if isinstance(prior_app, dict) else None,
+        )
         return Response(payload)
 
 

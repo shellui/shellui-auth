@@ -73,6 +73,34 @@ def _extract_user_data(provider: str, userinfo: dict, access_token: str) -> tupl
     return provider_id, email.lower(), full_name, avatar_url
 
 
+def _normalize_avatar_url(value: object) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _resolve_avatar_url_for_jwt(user: User, explicit: str | None = None) -> str | None:
+    """Resolve profile image URL for ShellUI JWT user_metadata (callback, refresh, rotation)."""
+    url = _normalize_avatar_url(explicit)
+    if url:
+        return url
+    cache_key = f"shellui:user_metadata:{user.id}"
+    cached = cache.get(cache_key) or {}
+    url = _normalize_avatar_url(cached.get('avatar_url') if isinstance(cached, dict) else None)
+    if url:
+        return url
+    for account in SocialAccount.objects.filter(user=user):
+        extra = account.extra_data or {}
+        if not isinstance(extra, dict):
+            continue
+        url = _normalize_avatar_url(
+            extra.get('avatar_url') or extra.get('picture') or extra.get('photo')
+        )
+        if url:
+            return url
+    return None
+
+
 def _issue_tokens(user: User) -> dict:
     user_payload = {
         'id': user.id,
@@ -130,10 +158,11 @@ def _enabled_oauth_providers() -> list[str]:
 def _issue_shellui_tokens(user: User, provider: str, avatar_url: str | None = None) -> dict:
     refresh = RefreshToken.for_user(user)
     preferences = _user_preferences_payload(user)
+    resolved_avatar = _resolve_avatar_url_for_jwt(user, avatar_url)
     user_metadata = {
         'name': user.get_full_name() or user.get_username(),
         'full_name': user.get_full_name() or user.get_username(),
-        'avatar_url': avatar_url,
+        'avatar_url': resolved_avatar,
         'shelluiPreferences': preferences,
     }
     app_metadata = {'provider': provider}
@@ -386,7 +415,12 @@ class ShellUITokenView(APIView):
         except Exception:
             return Response({'error': 'Invalid refresh token.'}, status=status.HTTP_401_UNAUTHORIZED)
 
-        payload = _issue_shellui_tokens(user, provider='refresh')
+        prior_meta = refresh.get('user_metadata')
+        prior_avatar = None
+        if isinstance(prior_meta, dict):
+            prior_avatar = _normalize_avatar_url(prior_meta.get('avatar_url'))
+
+        payload = _issue_shellui_tokens(user, provider='refresh', avatar_url=prior_avatar)
         return Response(payload)
 
 

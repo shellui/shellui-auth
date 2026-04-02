@@ -7,6 +7,7 @@ from django.conf import settings
 from django.core.cache import cache
 from django.http import HttpResponseRedirect
 from django.contrib.auth import get_user_model
+from django.db.models import Q
 from django.db.utils import OperationalError, ProgrammingError
 from allauth.socialaccount.models import SocialApp, SocialAccount
 from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema, extend_schema_view
@@ -20,7 +21,12 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import UserPreference
 from .oauth import build_authorize_url, exchange_code_for_token, fetch_provider_userinfo, get_provider_config
-from .serializers import ProviderAuthorizeSerializer, ProviderCallbackSerializer, UserPreferenceSerializer
+from .serializers import (
+    ProviderAuthorizeSerializer,
+    ProviderCallbackSerializer,
+    ShellUIAdminUserUpdateSerializer,
+    UserPreferenceSerializer,
+)
 
 User = get_user_model()
 FRONTEND_DEFAULT_REDIRECT_PATH = '/login/callback'
@@ -255,6 +261,37 @@ def _authenticate_bearer_user(request):
         return None
     user, _ = result
     return user
+
+
+def _require_staff(request):
+    user = _authenticate_bearer_user(request)
+    if not user:
+        return None, Response({'error': 'Unauthorized'}, status=status.HTTP_401_UNAUTHORIZED)
+    if not user.is_staff:
+        return None, Response({'error': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+    return user, None
+
+
+def _admin_user_payload(user: User) -> dict:
+    cache_key = f"shellui:user_metadata:{user.id}"
+    user_metadata = cache.get(cache_key) or {
+        'name': user.get_full_name() or user.get_username(),
+        'full_name': user.get_full_name() or user.get_username(),
+        'avatar_url': None,
+        'is_staff': bool(user.is_staff),
+    }
+    user_metadata['is_staff'] = bool(user.is_staff)
+    user_metadata['shelluiPreferences'] = _user_preferences_payload(user)
+    return {
+        'id': user.id,
+        'email': user.email,
+        'username': user.username,
+        'first_name': user.first_name or '',
+        'last_name': user.last_name or '',
+        'is_staff': user.is_staff,
+        'is_active': user.is_active,
+        'user_metadata': user_metadata,
+    }
 
 
 @extend_schema_view(
@@ -745,3 +782,162 @@ class ShellUIPreferenceView(APIView):
 
         UserPreference.objects.filter(user=user).delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+@extend_schema_view(
+    get=extend_schema(
+        tags=['auth-admin'],
+        summary='List users (staff)',
+        description='Paginated directory of users. Requires staff JWT.',
+        parameters=[
+            OpenApiParameter(
+                name='q',
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description='Search email, username, name, or numeric id.',
+            ),
+            OpenApiParameter(name='page', type=int, location=OpenApiParameter.QUERY, required=False),
+            OpenApiParameter(name='page_size', type=int, location=OpenApiParameter.QUERY, required=False),
+        ],
+    ),
+)
+class ShellUIAdminUserListView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        _staff, err = _require_staff(request)
+        if err:
+            return err
+
+        raw_q = request.GET.get('q', '') or ''
+        q = raw_q.strip()
+        try:
+            page = max(1, int(request.GET.get('page') or 1))
+            page_size = min(100, max(1, int(request.GET.get('page_size') or 20)))
+        except (TypeError, ValueError):
+            return Response(
+                {'error': 'Invalid page or page_size.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        qs = User.objects.all().order_by('-id')
+        if q:
+            q_filter = (
+                Q(email__icontains=q)
+                | Q(username__icontains=q)
+                | Q(first_name__icontains=q)
+                | Q(last_name__icontains=q)
+            )
+            if q.isdigit():
+                q_filter |= Q(pk=int(q))
+            qs = qs.filter(q_filter)
+
+        total = qs.count()
+        start = (page - 1) * page_size
+        results = [_admin_user_payload(u) for u in qs[start : start + page_size]]
+        return Response(
+            {
+                'count': total,
+                'page': page,
+                'page_size': page_size,
+                'results': results,
+            }
+        )
+
+
+@extend_schema_view(
+    get=extend_schema(
+        tags=['auth-admin'],
+        summary='Retrieve user (staff)',
+        description='Single user with ShellUI metadata. Requires staff JWT.',
+    ),
+    put=extend_schema(
+        tags=['auth-admin'],
+        summary='Update user (staff)',
+        description=(
+            'Update Django user fields and/or merge `data` into cached user_metadata (same shape as '
+            'PUT /auth/v1/user). Requires staff JWT.'
+        ),
+        request=ShellUIAdminUserUpdateSerializer,
+    ),
+)
+class ShellUIAdminUserDetailView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, pk):
+        _staff, err = _require_staff(request)
+        if err:
+            return err
+        try:
+            target = User.objects.get(pk=pk)
+        except User.DoesNotExist:
+            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(_admin_user_payload(target))
+
+    def put(self, request, pk):
+        staff, err = _require_staff(request)
+        if err:
+            return err
+        try:
+            target = User.objects.get(pk=pk)
+        except User.DoesNotExist:
+            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = ShellUIAdminUserUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        validated = serializer.validated_data
+
+        if target.pk == staff.pk:
+            if validated.get('is_staff') is False:
+                return Response(
+                    {'error': 'You cannot remove your own staff status.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if validated.get('is_active') is False:
+                return Response(
+                    {'error': 'You cannot deactivate your own account.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        update_fields: list[str] = []
+        if 'first_name' in validated:
+            target.first_name = validated['first_name']
+            update_fields.append('first_name')
+        if 'last_name' in validated:
+            target.last_name = validated['last_name']
+            update_fields.append('last_name')
+        if 'is_staff' in validated:
+            target.is_staff = validated['is_staff']
+            update_fields.append('is_staff')
+        if 'is_active' in validated:
+            target.is_active = validated['is_active']
+            update_fields.append('is_active')
+        if update_fields:
+            target.save(update_fields=list(dict.fromkeys(update_fields)))
+
+        data = validated.get('data')
+        if isinstance(data, dict):
+            cache_key = f"shellui:user_metadata:{target.id}"
+            current = cache.get(cache_key) or {}
+            merged = {**current, **data}
+            cache.set(cache_key, merged, timeout=60 * 60 * 24 * 30)
+            incoming_preferences = merged.get('shelluiPreferences')
+            if isinstance(incoming_preferences, dict):
+                pref_serializer = UserPreferenceSerializer(data=incoming_preferences)
+                if pref_serializer.is_valid():
+                    preference, _ = UserPreference.objects.get_or_create(user=target)
+                    pvalidated = pref_serializer.validated_data
+                    if 'themeName' in pvalidated:
+                        preference.theme_name = pvalidated['themeName']
+                    if 'language' in pvalidated:
+                        preference.language = pvalidated['language']
+                    if 'region' in pvalidated:
+                        preference.region = pvalidated['region']
+                    if 'colorScheme' in pvalidated:
+                        preference.color_scheme = pvalidated['colorScheme']
+                    preference.save()
+                    merged['shelluiPreferences'] = _user_preferences_payload(target)
+            else:
+                merged['shelluiPreferences'] = _user_preferences_payload(target)
+
+        return Response(_admin_user_payload(target))

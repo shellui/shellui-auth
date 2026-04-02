@@ -11,7 +11,7 @@ It supports OAuth login (GitHub/Google/Microsoft), issues JWT tokens, exposes Su
 - JWT access + refresh token issuance
 - Token refresh endpoint (`grant_type=refresh_token`)
 - User metadata endpoint (`/auth/v1/user`)
-- CORS setup for local ShellUI frontend (`http://localhost:4000`)
+- CORS for local ShellUI (`http://localhost:4000`), admin dev server (`http://localhost:5174`), and optional extra origins via env `CORS_ALLOWED_ORIGINS` (comma-separated)
 - OpenAPI docs with drf-spectacular
 
 ## Project Structure
@@ -29,6 +29,14 @@ It supports OAuth login (GitHub/Google/Microsoft), issues JWT tokens, exposes Su
 - `POST /auth/v1/logout` logout endpoint
 - `GET /auth/v1/user` return authenticated user profile + metadata
 - `PUT /auth/v1/user` update user metadata
+
+## Staff admin endpoints
+
+These routes require a valid JWT whose user has `is_staff=true` (`user_metadata.is_staff` is set from Django when tokens are issued).
+
+- `GET /auth/v1/admin/users?q=&page=&page_size=` — paginated user list (`page_size` capped at 100)
+- `GET /auth/v1/admin/users/<id>` — single user (Django fields + `user_metadata` cache)
+- `PUT /auth/v1/admin/users/<id>` — JSON body may include `first_name`, `last_name`, `is_staff`, `is_active`, and optional `data` object to merge into cached metadata (same idea as `PUT /auth/v1/user`). You cannot remove your own staff flag or deactivate yourself via this API.
 
 ## Quick Start
 

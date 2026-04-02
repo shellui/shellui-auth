@@ -159,10 +159,19 @@ SOCIALACCOUNT_PROVIDERS = {
     },
 }
 
-# Local ShellUI frontend origin for cross-origin auth calls.
+# Cross-origin: ShellUI app, admin iframe (Vite), and optional extra origins from env
+# (comma-separated), e.g. CORS_ALLOWED_ORIGINS=https://app.example.com,https://admin.example.com
 CORS_ALLOWED_ORIGINS = [
     'http://localhost:4000',
+    'http://127.0.0.1:4000',
+    'http://localhost:5174',
+    'http://127.0.0.1:5174',
 ]
+for _origin in os.getenv('CORS_ALLOWED_ORIGINS', '').split(','):
+    _origin = _origin.strip()
+    if _origin and _origin not in CORS_ALLOWED_ORIGINS:
+        CORS_ALLOWED_ORIGINS.append(_origin)
+
 CORS_ALLOW_CREDENTIALS = True
 
 # Database

@@ -7,7 +7,8 @@ from django.conf import settings
 from django.core.cache import cache
 from django.http import HttpResponse, HttpResponseRedirect
 from django.contrib.auth import get_user_model
-from django.db.models import Q
+from django.contrib.auth.models import Group
+from django.db.models import Count, Q
 from django.db.utils import OperationalError, ProgrammingError
 from allauth.socialaccount.models import SocialApp, SocialAccount
 from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema, extend_schema_view
@@ -26,6 +27,8 @@ from .oauth import build_authorize_url, exchange_code_for_token, fetch_provider_
 from .serializers import (
     ProviderAuthorizeSerializer,
     ProviderCallbackSerializer,
+    ShellUIAdminGroupCreateSerializer,
+    ShellUIAdminGroupUpdateSerializer,
     ShellUIAdminUserUpdateSerializer,
     UserPreferenceSerializer,
 )
@@ -42,6 +45,14 @@ def _user_preferences_payload(user: User) -> dict:
         'region': preference.region,
         'colorScheme': preference.color_scheme,
     }
+
+
+def _user_group_names(user: User) -> list[str]:
+    return list(user.groups.values_list('name', flat=True).order_by('name'))
+
+
+def _admin_user_group_rows(user: User) -> list[dict]:
+    return list(user.groups.values('id', 'name').order_by('name'))
 
 
 def _extract_user_data(provider: str, userinfo: dict, access_token: str) -> tuple[str, str, str, str | None]:
@@ -196,6 +207,7 @@ def _issue_shellui_tokens(
         'avatar_url': resolved_avatar,
         'is_staff': bool(user.is_staff),
         'shelluiPreferences': preferences,
+        'groups': _user_group_names(user),
     }
     app_meta_base = dict(prior_app_metadata) if isinstance(prior_app_metadata, dict) else {}
     prior_provider = app_meta_base.get('provider') if isinstance(app_meta_base.get('provider'), str) else None
@@ -284,6 +296,8 @@ def _admin_user_payload(user: User) -> dict:
     }
     user_metadata['is_staff'] = bool(user.is_staff)
     user_metadata['shelluiPreferences'] = _user_preferences_payload(user)
+    group_rows = _admin_user_group_rows(user)
+    user_metadata['groups'] = [row['name'] for row in group_rows]
     return {
         'id': user.id,
         'email': user.email,
@@ -292,6 +306,7 @@ def _admin_user_payload(user: User) -> dict:
         'last_name': user.last_name or '',
         'is_staff': user.is_staff,
         'is_active': user.is_active,
+        'groups': group_rows,
         'user_metadata': user_metadata,
     }
 
@@ -666,6 +681,7 @@ class ShellUIUserView(APIView):
         }
         user_metadata['is_staff'] = bool(user.is_staff)
         user_metadata['shelluiPreferences'] = _user_preferences_payload(user)
+        user_metadata['groups'] = _user_group_names(user)
         return Response(
             {
                 'id': str(user.id),
@@ -685,10 +701,10 @@ class ShellUIUserView(APIView):
                 {'error': 'Expected JSON body with object field `data`.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        data = {k: v for k, v in data.items() if k != 'groups'}
         cache_key = f"shellui:user_metadata:{user.id}"
         current = cache.get(cache_key) or {}
         merged = {**current, **data}
-        cache.set(cache_key, merged, timeout=60 * 60 * 24 * 30)
         incoming_preferences = merged.get('shelluiPreferences')
         if isinstance(incoming_preferences, dict):
             serializer = UserPreferenceSerializer(data=incoming_preferences)
@@ -707,6 +723,8 @@ class ShellUIUserView(APIView):
                 merged['shelluiPreferences'] = _user_preferences_payload(user)
         else:
             merged['shelluiPreferences'] = _user_preferences_payload(user)
+        merged['groups'] = _user_group_names(user)
+        cache.set(cache_key, merged, timeout=60 * 60 * 24 * 30)
         return Response(
             {
                 'id': str(user.id),
@@ -824,7 +842,7 @@ class ShellUIAdminUserListView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        qs = User.objects.all().order_by('-id')
+        qs = User.objects.all().order_by('-id').prefetch_related('groups')
         if q:
             q_filter = (
                 Q(email__icontains=q)
@@ -919,8 +937,12 @@ class ShellUIAdminUserDetailView(APIView):
         if update_fields:
             target.save(update_fields=list(dict.fromkeys(update_fields)))
 
+        if 'group_ids' in validated:
+            target.groups.set(Group.objects.filter(pk__in=validated['group_ids']))
+
         data = validated.get('data')
         if isinstance(data, dict):
+            data = {k: v for k, v in data.items() if k != 'groups'}
             cache_key = f"shellui:user_metadata:{target.id}"
             current = cache.get(cache_key) or {}
             merged = {**current, **data}
@@ -945,6 +967,114 @@ class ShellUIAdminUserDetailView(APIView):
                 merged['shelluiPreferences'] = _user_preferences_payload(target)
 
         return Response(_admin_user_payload(target))
+
+
+@extend_schema_view(
+    get=extend_schema(
+        tags=['auth-admin'],
+        summary='List auth groups (staff)',
+        description='All Django auth groups (`auth_group`) with `user_count`. Requires staff JWT.',
+    ),
+    post=extend_schema(
+        tags=['auth-admin'],
+        summary='Create auth group (staff)',
+        description='Create a named group. Requires staff JWT.',
+        request=ShellUIAdminGroupCreateSerializer,
+    ),
+)
+class ShellUIAdminGroupListView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        _staff, err = _require_staff(request)
+        if err:
+            return err
+        rows = list(
+            Group.objects.annotate(user_count=Count('user', distinct=True))
+            .values('id', 'name', 'user_count')
+            .order_by('name')
+        )
+        return Response(rows)
+
+    def post(self, request):
+        _staff, err = _require_staff(request)
+        if err:
+            return err
+        serializer = ShellUIAdminGroupCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        name = str(serializer.validated_data['name']).strip()
+        if not name:
+            return Response({'error': 'Group name is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if Group.objects.filter(name=name).exists():
+            return Response(
+                {'error': 'A group with this name already exists.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        g = Group.objects.create(name=name)
+        return Response({'id': g.id, 'name': g.name, 'user_count': 0}, status=status.HTTP_201_CREATED)
+
+
+@extend_schema_view(
+    get=extend_schema(
+        tags=['auth-admin'],
+        summary='Retrieve auth group (staff)',
+    ),
+    put=extend_schema(
+        tags=['auth-admin'],
+        summary='Rename auth group (staff)',
+        request=ShellUIAdminGroupUpdateSerializer,
+    ),
+    delete=extend_schema(
+        tags=['auth-admin'],
+        summary='Delete auth group (staff)',
+    ),
+)
+class ShellUIAdminGroupDetailView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, pk):
+        _staff, err = _require_staff(request)
+        if err:
+            return err
+        try:
+            g = Group.objects.annotate(user_count=Count('user', distinct=True)).get(pk=pk)
+        except Group.DoesNotExist:
+            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response({'id': g.id, 'name': g.name, 'user_count': g.user_count})
+
+    def put(self, request, pk):
+        _staff, err = _require_staff(request)
+        if err:
+            return err
+        try:
+            g = Group.objects.annotate(user_count=Count('user', distinct=True)).get(pk=pk)
+        except Group.DoesNotExist:
+            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        serializer = ShellUIAdminGroupUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        name = str(serializer.validated_data['name']).strip()
+        if not name:
+            return Response({'error': 'Group name is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if Group.objects.filter(name=name).exclude(pk=g.pk).exists():
+            return Response(
+                {'error': 'A group with this name already exists.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        g.name = name
+        g.save(update_fields=['name'])
+        g = Group.objects.annotate(user_count=Count('user', distinct=True)).get(pk=g.pk)
+        return Response({'id': g.id, 'name': g.name, 'user_count': g.user_count})
+
+    def delete(self, request, pk):
+        _staff, err = _require_staff(request)
+        if err:
+            return err
+        try:
+            g = Group.objects.get(pk=pk)
+        except Group.DoesNotExist:
+            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        g.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 @extend_schema_view(

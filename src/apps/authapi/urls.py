@@ -1,6 +1,8 @@
 from django.urls import path
 
 from .views import (
+    ShellUIAdminGroupDetailView,
+    ShellUIAdminGroupListView,
     ShellUIAdminMetricsView,
     ShellUIAdminUserDetailView,
     ShellUIAdminUserListView,
@@ -22,6 +24,8 @@ urlpatterns = [
     path('token', ShellUITokenView.as_view(), name='shellui-token'),
     path('logout', ShellUILogoutView.as_view(), name='shellui-logout'),
     path('user', ShellUIUserView.as_view(), name='shellui-user'),
+    path('admin/groups', ShellUIAdminGroupListView.as_view(), name='shellui-admin-groups'),
+    path('admin/groups/<int:pk>', ShellUIAdminGroupDetailView.as_view(), name='shellui-admin-group-detail'),
     path('admin/users', ShellUIAdminUserListView.as_view(), name='shellui-admin-users'),
     path('admin/metrics', ShellUIAdminMetricsView.as_view(), name='shellui-admin-metrics'),
     path('admin/users/<int:pk>', ShellUIAdminUserDetailView.as_view(), name='shellui-admin-user-detail'),

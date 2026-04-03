@@ -25,3 +25,16 @@ class ShellUIAdminUserUpdateSerializer(serializers.Serializer):
     is_staff = serializers.BooleanField(required=False)
     is_active = serializers.BooleanField(required=False)
     data = serializers.JSONField(required=False)
+    group_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        required=False,
+        allow_empty=True,
+    )
+
+
+class ShellUIAdminGroupCreateSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=150)
+
+
+class ShellUIAdminGroupUpdateSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=150)

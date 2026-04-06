@@ -1138,8 +1138,8 @@ class ShellUIAdminUserListView(APIView):
         summary='Update user (staff or company owner)',
         description=(
             'Update Django user fields and/or merge `data` into cached user_metadata (same shape as '
-            'PUT /auth/v1/user). Staff may change is_staff, is_active, and group_ids. '
-            'Company owners may only update first_name, last_name, and `data`.'
+            'PUT /auth/v1/user). Staff may change is_staff and is_active. Staff and company owners '
+            'may change first_name, last_name, group_ids (within this company), and `data`.'
         ),
         request=ShellUIAdminUserUpdateSerializer,
     ),
@@ -1170,12 +1170,10 @@ class ShellUIAdminUserDetailView(APIView):
         serializer.is_valid(raise_exception=True)
         validated = serializer.validated_data
 
-        if not actor.is_staff and any(
-            k in validated for k in ('is_staff', 'is_active', 'group_ids')
-        ):
+        if not actor.is_staff and any(k in validated for k in ('is_staff', 'is_active')):
             return Response(
                 {
-                    'error': 'Only staff may change is_staff, is_active, or group membership.',
+                    'error': 'Only staff may change is_staff or is_active.',
                 },
                 status=status.HTTP_403_FORBIDDEN,
             )

@@ -44,6 +44,7 @@ class ShellUIAdminGroupUpdateSerializer(serializers.Serializer):
 
 class ShellUIAdminLoginEventSerializer(serializers.Serializer):
     id = serializers.IntegerField()
+    company_id = serializers.IntegerField(allow_null=True)
     created_at = serializers.DateTimeField()
     user_id = serializers.IntegerField(allow_null=True)
     user_email = serializers.EmailField(allow_null=True, required=False)

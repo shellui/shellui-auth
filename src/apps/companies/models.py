@@ -11,6 +11,11 @@ class Company(models.Model):
         related_name='companies',
         blank=True,
     )
+    owners = models.ManyToManyField(
+        settings.AUTH_USER_MODEL,
+        related_name='owned_companies',
+        blank=True,
+    )
 
     class Meta:
         ordering = ['name']
@@ -28,3 +33,26 @@ class Company(models.Model):
                 suffix += 1
             self.slug = candidate
         super().save(*args, **kwargs)
+
+
+class CompanyGroup(models.Model):
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name='groups',
+    )
+    name = models.CharField(max_length=150)
+    members = models.ManyToManyField(
+        settings.AUTH_USER_MODEL,
+        related_name='company_groups',
+        blank=True,
+    )
+
+    class Meta:
+        ordering = ['name']
+        constraints = [
+            models.UniqueConstraint(fields=['company', 'name'], name='company_group_unique_name_per_company'),
+        ]
+
+    def __str__(self) -> str:
+        return f'{self.company_id}:{self.name}'

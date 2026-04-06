@@ -29,6 +29,13 @@ class LoginEvent(models.Model):
         on_delete=models.SET_NULL,
         related_name='login_events',
     )
+    company = models.ForeignKey(
+        'companies.Company',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='login_events',
+    )
     outcome = models.CharField(max_length=16, choices=OUTCOME_CHOICES, db_index=True)
     provider = models.CharField(max_length=32, db_index=True)
     failure_reason = models.CharField(max_length=255, blank=True)

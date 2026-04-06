@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from django.conf import settings
 
 if TYPE_CHECKING:
+    from apps.companies.models import Company
     from django.contrib.auth.base_user import AbstractBaseUser
     from django.http import HttpRequest
 
@@ -132,6 +133,7 @@ def record_login_event(
     outcome: str,
     provider: str,
     user: AbstractBaseUser | None = None,
+    company: Company | None = None,
     failure_reason: str | None = None,
     client_timezone: str = '',
     client_device_id: str | None = None,
@@ -155,6 +157,7 @@ def record_login_event(
 
     return LoginEvent.objects.create(
         user=user if user is not None else None,
+        company=company if company is not None else None,
         outcome=outcome,
         provider=str(provider).lower()[:32] if provider else 'unknown',
         failure_reason=sanitize_failure_reason(failure_reason),
@@ -172,6 +175,7 @@ def oauth_callback_query_string(
     *,
     provider: str,
     redirect_to: str,
+    company_id: str | None = None,
     client_timezone: str | None = None,
     client_device_id: str | None = None,
 ) -> str:
@@ -182,6 +186,8 @@ def oauth_callback_query_string(
         'provider': provider,
         'redirect_to': redirect_to,
     }
+    if company_id and str(company_id).strip():
+        params['company_id'] = str(company_id).strip()
     tz = normalize_client_timezone(client_timezone)
     if tz:
         params['client_timezone'] = tz
@@ -196,9 +202,11 @@ def oauth_callback_url(request: HttpRequest, provider: str, redirect_to: str) ->
     """Full redirect_uri for OAuth (authorize + callback token exchange)."""
     tz = request.GET.get('client_timezone', '') if hasattr(request, 'GET') else ''
     dev = request.GET.get('client_device_id', '') if hasattr(request, 'GET') else ''
+    company_id = request.GET.get('company_id', '') if hasattr(request, 'GET') else ''
     qs = oauth_callback_query_string(
         provider=provider,
         redirect_to=redirect_to,
+        company_id=company_id or None,
         client_timezone=tz or None,
         client_device_id=dev or None,
     )

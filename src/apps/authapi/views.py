@@ -9,7 +9,6 @@ from django.core.exceptions import ObjectDoesNotExist
 from django.http import HttpResponse, HttpResponseRedirect
 from django.utils.dateparse import parse_datetime
 from django.contrib.auth import get_user_model
-from django.contrib.auth.models import Group
 from django.contrib.auth.signals import user_logged_in
 from django.db.models import Count, Q
 from django.db.utils import OperationalError, ProgrammingError
@@ -24,6 +23,7 @@ from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from . import metrics as auth_metrics
+from apps.companies.models import Company, CompanyGroup
 from .renderers import DEFAULT_METRICS_RENDERERS
 from .login_audit import oauth_callback_url, record_login_event
 from .models import LoginEvent, UserPreference
@@ -82,12 +82,16 @@ def _user_preferences_payload(user: User) -> dict:
     }
 
 
-def _user_group_names(user: User) -> list[str]:
-    return list(user.groups.values_list('name', flat=True).order_by('name'))
+def _user_group_names(user: User, company: Company) -> list[str]:
+    return list(
+        CompanyGroup.objects.filter(company=company, members=user).values_list('name', flat=True).order_by('name')
+    )
 
 
-def _admin_user_group_rows(user: User) -> list[dict]:
-    return list(user.groups.values('id', 'name').order_by('name'))
+def _admin_user_group_rows(user: User, company: Company) -> list[dict]:
+    return list(
+        CompanyGroup.objects.filter(company=company, members=user).values('id', 'name').order_by('name')
+    )
 
 
 def _extract_user_data(provider: str, userinfo: dict, access_token: str) -> tuple[str, str, str, str | None]:
@@ -172,7 +176,7 @@ def _resolve_auth_provider_for_jwt(
     return 'refresh'
 
 
-def _issue_tokens(user: User) -> dict:
+def _issue_tokens(user: User, company: Company) -> dict:
     user_payload = {
         'id': user.id,
         'email': user.email,
@@ -181,8 +185,10 @@ def _issue_tokens(user: User) -> dict:
     }
     refresh = RefreshToken.for_user(user)
     refresh['user'] = user_payload
+    refresh['company_id'] = company.id
     access = refresh.access_token
     access['user'] = user_payload
+    access['company_id'] = company.id
     return {
         'refresh': str(refresh),
         'access': str(access),
@@ -228,6 +234,7 @@ def _enabled_oauth_providers() -> list[str]:
 
 def _issue_shellui_tokens(
     user: User,
+    company: Company,
     avatar_url: str | None = None,
     *,
     oauth_provider: str | None = None,
@@ -242,7 +249,7 @@ def _issue_shellui_tokens(
         'avatar_url': resolved_avatar,
         'is_staff': bool(user.is_staff),
         'shelluiPreferences': preferences,
-        'groups': _user_group_names(user),
+        'groups': _user_group_names(user, company),
     }
     app_meta_base = dict(prior_app_metadata) if isinstance(prior_app_metadata, dict) else {}
     prior_provider = app_meta_base.get('provider') if isinstance(app_meta_base.get('provider'), str) else None
@@ -254,9 +261,11 @@ def _issue_shellui_tokens(
     app_metadata = app_meta_base
     access = refresh.access_token
     access['email'] = user.email
+    access['company_id'] = company.id
     access['user_metadata'] = user_metadata
     access['app_metadata'] = app_metadata
     refresh['user_metadata'] = user_metadata
+    refresh['company_id'] = company.id
     refresh['app_metadata'] = app_metadata
     now_ts = int(datetime.now(timezone.utc).timestamp())
     expires_at = int(access['exp'])
@@ -312,18 +321,48 @@ def _authenticate_bearer_user(request):
     return user
 
 
+def _required_company_from_request(request, user: User | None = None) -> tuple[Company | None, Response | None]:
+    raw = (request.GET.get('company_id') or request.data.get('company_id') or '').strip()
+    if not raw:
+        return None, Response({'error': 'Missing company_id parameter.'}, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        company_id = int(raw)
+    except (TypeError, ValueError):
+        return None, Response({'error': 'Invalid company_id parameter.'}, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        company = Company.objects.get(pk=company_id)
+    except Company.DoesNotExist:
+        return None, Response({'error': 'Company not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    if user is not None:
+        if not company.members.filter(pk=user.pk).exists():
+            return None, Response({'error': 'Forbidden for this company.'}, status=status.HTTP_403_FORBIDDEN)
+        auth_token = getattr(request, 'auth', None)
+        auth_company_id = auth_token.get('company_id') if auth_token is not None and hasattr(auth_token, 'get') else None
+        if auth_company_id is not None and int(auth_company_id) != company.id:
+            return None, Response(
+                {'error': 'Requested company_id does not match token company_id.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+    return company, None
+
+
 def _require_staff(request):
     user = _authenticate_bearer_user(request)
     if not user:
-        return None, Response({'error': 'Unauthorized'}, status=status.HTTP_401_UNAUTHORIZED)
+        return None, None, Response({'error': 'Unauthorized'}, status=status.HTTP_401_UNAUTHORIZED)
     if not user.is_staff:
-        return None, Response({'error': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
-    return user, None
+        return None, None, Response({'error': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+    company, cerr = _required_company_from_request(request, user=user)
+    if cerr:
+        return None, None, cerr
+    return user, company, None
 
 
 def _login_event_payload(event: LoginEvent) -> dict:
     return {
         'id': event.id,
+        'company_id': event.company_id,
         'created_at': event.created_at,
         'user_id': event.user_id,
         'user_email': event.user.email if event.user_id else None,
@@ -340,7 +379,7 @@ def _login_event_payload(event: LoginEvent) -> dict:
     }
 
 
-def _admin_user_payload(user: User) -> dict:
+def _admin_user_payload(user: User, company: Company) -> dict:
     cache_key = f"shellui:user_metadata:{user.id}"
     user_metadata = cache.get(cache_key) or {
         'name': user.get_full_name() or user.get_username(),
@@ -350,7 +389,7 @@ def _admin_user_payload(user: User) -> dict:
     }
     user_metadata['is_staff'] = bool(user.is_staff)
     user_metadata['shelluiPreferences'] = _user_preferences_payload(user)
-    group_rows = _admin_user_group_rows(user)
+    group_rows = _admin_user_group_rows(user, company)
     user_metadata['groups'] = [row['name'] for row in group_rows]
     user_metadata['last_seen_at'] = _last_seen_at_for_user(user)
     _enrich_user_metadata_avatar(user, user_metadata)
@@ -379,6 +418,9 @@ class SocialAuthorizeView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request, provider: str):
+        _company, company_err = _required_company_from_request(request)
+        if company_err:
+            return company_err
         serializer = ProviderAuthorizeSerializer(data=request.query_params)
         serializer.is_valid(raise_exception=True)
         authorize_url = build_authorize_url(
@@ -401,6 +443,9 @@ class SocialLoginView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request, provider: str):
+        company, company_err = _required_company_from_request(request)
+        if company_err:
+            return company_err
         serializer = ProviderCallbackSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
@@ -420,6 +465,7 @@ class SocialLoginView(APIView):
                 outcome=LoginEvent.OUTCOME_FAILURE,
                 provider=provider,
                 user=None,
+                company=company,
                 failure_reason=str(exc),
                 client_timezone=client_tz,
                 client_device_id=client_dev,
@@ -443,6 +489,8 @@ class SocialLoginView(APIView):
             if not user.last_name and ' ' in full_name:
                 user.last_name = ' '.join(full_name.split(' ')[1:])
             user.save(update_fields=['first_name', 'last_name'])
+        if not company.members.filter(pk=user.pk).exists():
+            company.members.add(user)
         _link_social_account(user=user, provider=provider, provider_id=provider_id, userinfo=userinfo)
 
         cache.set(
@@ -456,16 +504,17 @@ class SocialLoginView(APIView):
         )
 
         _notify_user_logged_in_for_oauth(request, user)
-        auth_metrics.record_successful_login(provider)
+        auth_metrics.record_successful_login(provider, company_id=company.id)
         record_login_event(
             request=request,
             outcome=LoginEvent.OUTCOME_SUCCESS,
             provider=provider,
             user=user,
+            company=company,
             client_timezone=client_tz,
             client_device_id=client_dev,
         )
-        token_payload = _issue_tokens(user)
+        token_payload = _issue_tokens(user, company=company)
         return Response(token_payload, status=status.HTTP_200_OK)
 
 
@@ -487,7 +536,10 @@ class SocialLoginView(APIView):
 class ShellUIAuthSettingsView(APIView):
     permission_classes = [AllowAny]
 
-    def get(self, _request):
+    def get(self, request):
+        _company, company_err = _required_company_from_request(request)
+        if company_err:
+            return company_err
         providers = _enabled_oauth_providers()
         external = {provider: True for provider in providers}
         return Response(
@@ -555,6 +607,9 @@ class ShellUIAuthorizeView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request):
+        _company, company_err = _required_company_from_request(request)
+        if company_err:
+            return company_err
         provider = request.GET.get('provider', '').strip().lower()
         if not provider:
             return Response({'error': 'Missing provider parameter.'}, status=status.HTTP_400_BAD_REQUEST)
@@ -636,6 +691,9 @@ class ShellUIOAuthCallbackView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request):
+        company, company_err = _required_company_from_request(request)
+        if company_err:
+            return company_err
         provider = request.GET.get('provider', '').strip().lower()
         code = request.GET.get('code', '').strip()
         redirect_to = _resolve_redirect_to(request)
@@ -654,6 +712,7 @@ class ShellUIOAuthCallbackView(APIView):
                 outcome=LoginEvent.OUTCOME_FAILURE,
                 provider=provider,
                 user=None,
+                company=company,
                 failure_reason=str(exc),
                 client_timezone=client_tz,
                 client_device_id=client_dev,
@@ -674,6 +733,8 @@ class ShellUIOAuthCallbackView(APIView):
             if not user.last_name and ' ' in full_name:
                 user.last_name = ' '.join(full_name.split(' ')[1:])
             user.save(update_fields=['first_name', 'last_name'])
+        if not company.members.filter(pk=user.pk).exists():
+            company.members.add(user)
         _link_social_account(user=user, provider=provider, provider_id=provider_id, userinfo=userinfo)
 
         cache.set(
@@ -686,13 +747,14 @@ class ShellUIOAuthCallbackView(APIView):
             timeout=60 * 60 * 24 * 30,
         )
         _notify_user_logged_in_for_oauth(request, user)
-        payload = _issue_shellui_tokens(user, avatar_url=avatar_url, oauth_provider=provider)
-        auth_metrics.record_successful_login(provider)
+        payload = _issue_shellui_tokens(user, company=company, avatar_url=avatar_url, oauth_provider=provider)
+        auth_metrics.record_successful_login(provider, company_id=company.id)
         record_login_event(
             request=request,
             outcome=LoginEvent.OUTCOME_SUCCESS,
             provider=provider,
             user=user,
+            company=company,
             client_timezone=client_tz,
             client_device_id=client_dev,
         )
@@ -727,6 +789,9 @@ class ShellUITokenView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
+        company, company_err = _required_company_from_request(request)
+        if company_err:
+            return company_err
         grant_type = request.GET.get('grant_type') or request.data.get('grant_type')
         if grant_type != 'refresh_token':
             return Response(
@@ -750,8 +815,12 @@ class ShellUITokenView(APIView):
 
         prior_app = refresh.get('app_metadata')
         touch_user_last_seen(user)
+        if not company.members.filter(pk=user.pk).exists():
+            return Response({'error': 'Forbidden for this company.'}, status=status.HTTP_403_FORBIDDEN)
+
         payload = _issue_shellui_tokens(
             user,
+            company=company,
             avatar_url=prior_avatar,
             prior_app_metadata=prior_app if isinstance(prior_app, dict) else None,
         )
@@ -769,7 +838,10 @@ class ShellUITokenView(APIView):
 class ShellUILogoutView(APIView):
     permission_classes = [AllowAny]
 
-    def post(self, _request):
+    def post(self, request):
+        _company, company_err = _required_company_from_request(request)
+        if company_err:
+            return company_err
         return Response({'success': True})
 
 
@@ -807,6 +879,9 @@ class ShellUIUserView(APIView):
         user = _authenticate_bearer_user(request)
         if not user:
             return Response({'error': 'Unauthorized'}, status=status.HTTP_401_UNAUTHORIZED)
+        company, company_err = _required_company_from_request(request, user=user)
+        if company_err:
+            return company_err
         user = User.objects.select_related('activity').get(pk=user.pk)
         cache_key = f"shellui:user_metadata:{user.id}"
         user_metadata = cache.get(cache_key) or {
@@ -817,14 +892,14 @@ class ShellUIUserView(APIView):
         }
         user_metadata['is_staff'] = bool(user.is_staff)
         user_metadata['shelluiPreferences'] = _user_preferences_payload(user)
-        user_metadata['groups'] = _user_group_names(user)
+        user_metadata['groups'] = _user_group_names(user, company)
         user_metadata['last_seen_at'] = _last_seen_at_for_user(user)
         _enrich_user_metadata_avatar(user, user_metadata)
         return Response(
             {
                 'id': str(user.id),
                 'email': user.email,
-                'app_metadata': {'provider': 'django'},
+                'app_metadata': {'provider': 'django', 'company_id': company.id},
                 'user_metadata': user_metadata,
             }
         )
@@ -833,6 +908,9 @@ class ShellUIUserView(APIView):
         user = _authenticate_bearer_user(request)
         if not user:
             return Response({'error': 'Unauthorized'}, status=status.HTTP_401_UNAUTHORIZED)
+        company, company_err = _required_company_from_request(request, user=user)
+        if company_err:
+            return company_err
         user = User.objects.select_related('activity').get(pk=user.pk)
         data = request.data.get('data')
         if not isinstance(data, dict):
@@ -862,7 +940,7 @@ class ShellUIUserView(APIView):
                 merged['shelluiPreferences'] = _user_preferences_payload(user)
         else:
             merged['shelluiPreferences'] = _user_preferences_payload(user)
-        merged['groups'] = _user_group_names(user)
+        merged['groups'] = _user_group_names(user, company)
         merged.pop('last_seen_at', None)
         merged['last_seen_at'] = _last_seen_at_for_user(user)
         _enrich_user_metadata_avatar(user, merged)
@@ -871,7 +949,7 @@ class ShellUIUserView(APIView):
             {
                 'id': str(user.id),
                 'email': user.email,
-                'app_metadata': {'provider': 'django'},
+                'app_metadata': {'provider': 'django', 'company_id': company.id},
                 'user_metadata': merged,
             }
         )
@@ -915,6 +993,9 @@ class ShellUIPreferenceView(APIView):
         user = _authenticate_bearer_user(request)
         if not user:
             return Response({'error': 'Unauthorized'}, status=status.HTTP_401_UNAUTHORIZED)
+        _company, company_err = _required_company_from_request(request, user=user)
+        if company_err:
+            return company_err
 
         return Response(_user_preferences_payload(user), status=status.HTTP_200_OK)
 
@@ -922,6 +1003,9 @@ class ShellUIPreferenceView(APIView):
         user = _authenticate_bearer_user(request)
         if not user:
             return Response({'error': 'Unauthorized'}, status=status.HTTP_401_UNAUTHORIZED)
+        _company, company_err = _required_company_from_request(request, user=user)
+        if company_err:
+            return company_err
 
         serializer = UserPreferenceSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -943,6 +1027,9 @@ class ShellUIPreferenceView(APIView):
         user = _authenticate_bearer_user(request)
         if not user:
             return Response({'error': 'Unauthorized'}, status=status.HTTP_401_UNAUTHORIZED)
+        _company, company_err = _required_company_from_request(request, user=user)
+        if company_err:
+            return company_err
 
         UserPreference.objects.filter(user=user).delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
@@ -969,7 +1056,7 @@ class ShellUIAdminUserListView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request):
-        _staff, err = _require_staff(request)
+        _staff, company, err = _require_staff(request)
         if err:
             return err
 
@@ -984,7 +1071,9 @@ class ShellUIAdminUserListView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        qs = User.objects.all().order_by('-id').select_related('activity').prefetch_related('groups')
+        qs = (
+            User.objects.filter(companies=company).distinct().order_by('-id').select_related('activity').prefetch_related('groups')
+        )
         if q:
             q_filter = (
                 Q(email__icontains=q)
@@ -998,7 +1087,7 @@ class ShellUIAdminUserListView(APIView):
 
         total = qs.count()
         start = (page - 1) * page_size
-        results = [_admin_user_payload(u) for u in qs[start : start + page_size]]
+        results = [_admin_user_payload(u, company) for u in qs[start : start + page_size]]
         return Response(
             {
                 'count': total,
@@ -1029,21 +1118,21 @@ class ShellUIAdminUserDetailView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request, pk):
-        _staff, err = _require_staff(request)
+        _staff, company, err = _require_staff(request)
         if err:
             return err
         try:
-            target = User.objects.select_related('activity').get(pk=pk)
+            target = User.objects.select_related('activity').get(pk=pk, companies=company)
         except User.DoesNotExist:
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
-        return Response(_admin_user_payload(target))
+        return Response(_admin_user_payload(target, company))
 
     def put(self, request, pk):
-        staff, err = _require_staff(request)
+        staff, company, err = _require_staff(request)
         if err:
             return err
         try:
-            target = User.objects.select_related('activity').get(pk=pk)
+            target = User.objects.select_related('activity').get(pk=pk, companies=company)
         except User.DoesNotExist:
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
 
@@ -1080,7 +1169,20 @@ class ShellUIAdminUserDetailView(APIView):
             target.save(update_fields=list(dict.fromkeys(update_fields)))
 
         if 'group_ids' in validated:
-            target.groups.set(Group.objects.filter(pk__in=validated['group_ids']))
+            requested_ids = set(validated['group_ids'])
+            company_groups = CompanyGroup.objects.filter(company=company).order_by('id')
+            existing_ids = set(company_groups.values_list('id', flat=True))
+            missing_ids = sorted(requested_ids - existing_ids)
+            if missing_ids:
+                return Response(
+                    {'error': f'Unknown group ids for this company: {missing_ids}.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            for g in company_groups:
+                if g.id in requested_ids:
+                    g.members.add(target)
+                else:
+                    g.members.remove(target)
 
         data = validated.get('data')
         if isinstance(data, dict):
@@ -1109,14 +1211,14 @@ class ShellUIAdminUserDetailView(APIView):
             else:
                 merged['shelluiPreferences'] = _user_preferences_payload(target)
 
-        return Response(_admin_user_payload(target))
+        return Response(_admin_user_payload(target, company))
 
 
 @extend_schema_view(
     get=extend_schema(
         tags=['auth-admin'],
         summary='List auth groups (staff)',
-        description='All Django auth groups (`auth_group`) with `user_count`. Requires staff JWT.',
+        description='All company groups for requested company with `user_count`. Requires staff JWT.',
     ),
     post=extend_schema(
         tags=['auth-admin'],
@@ -1129,18 +1231,19 @@ class ShellUIAdminGroupListView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request):
-        _staff, err = _require_staff(request)
+        _staff, company, err = _require_staff(request)
         if err:
             return err
         rows = list(
-            Group.objects.annotate(user_count=Count('user', distinct=True))
+            CompanyGroup.objects.filter(company=company)
+            .annotate(user_count=Count('members', distinct=True))
             .values('id', 'name', 'user_count')
             .order_by('name')
         )
         return Response(rows)
 
     def post(self, request):
-        _staff, err = _require_staff(request)
+        _staff, company, err = _require_staff(request)
         if err:
             return err
         serializer = ShellUIAdminGroupCreateSerializer(data=request.data)
@@ -1148,12 +1251,12 @@ class ShellUIAdminGroupListView(APIView):
         name = str(serializer.validated_data['name']).strip()
         if not name:
             return Response({'error': 'Group name is required.'}, status=status.HTTP_400_BAD_REQUEST)
-        if Group.objects.filter(name=name).exists():
+        if CompanyGroup.objects.filter(company=company, name=name).exists():
             return Response(
                 {'error': 'A group with this name already exists.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        g = Group.objects.create(name=name)
+        g = CompanyGroup.objects.create(company=company, name=name)
         return Response({'id': g.id, 'name': g.name, 'user_count': 0}, status=status.HTTP_201_CREATED)
 
 
@@ -1176,45 +1279,45 @@ class ShellUIAdminGroupDetailView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request, pk):
-        _staff, err = _require_staff(request)
+        _staff, company, err = _require_staff(request)
         if err:
             return err
         try:
-            g = Group.objects.annotate(user_count=Count('user', distinct=True)).get(pk=pk)
-        except Group.DoesNotExist:
+            g = CompanyGroup.objects.filter(company=company).annotate(user_count=Count('members', distinct=True)).get(pk=pk)
+        except CompanyGroup.DoesNotExist:
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
         return Response({'id': g.id, 'name': g.name, 'user_count': g.user_count})
 
     def put(self, request, pk):
-        _staff, err = _require_staff(request)
+        _staff, company, err = _require_staff(request)
         if err:
             return err
         try:
-            g = Group.objects.annotate(user_count=Count('user', distinct=True)).get(pk=pk)
-        except Group.DoesNotExist:
+            g = CompanyGroup.objects.filter(company=company).annotate(user_count=Count('members', distinct=True)).get(pk=pk)
+        except CompanyGroup.DoesNotExist:
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
         serializer = ShellUIAdminGroupUpdateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         name = str(serializer.validated_data['name']).strip()
         if not name:
             return Response({'error': 'Group name is required.'}, status=status.HTTP_400_BAD_REQUEST)
-        if Group.objects.filter(name=name).exclude(pk=g.pk).exists():
+        if CompanyGroup.objects.filter(company=company, name=name).exclude(pk=g.pk).exists():
             return Response(
                 {'error': 'A group with this name already exists.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         g.name = name
         g.save(update_fields=['name'])
-        g = Group.objects.annotate(user_count=Count('user', distinct=True)).get(pk=g.pk)
+        g = CompanyGroup.objects.filter(company=company).annotate(user_count=Count('members', distinct=True)).get(pk=g.pk)
         return Response({'id': g.id, 'name': g.name, 'user_count': g.user_count})
 
     def delete(self, request, pk):
-        _staff, err = _require_staff(request)
+        _staff, company, err = _require_staff(request)
         if err:
             return err
         try:
-            g = Group.objects.get(pk=pk)
-        except Group.DoesNotExist:
+            g = CompanyGroup.objects.filter(company=company).get(pk=pk)
+        except CompanyGroup.DoesNotExist:
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
         g.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
@@ -1313,7 +1416,7 @@ class ShellUIAdminLoginEventListView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request):
-        _staff, err = _require_staff(request)
+        _staff, company, err = _require_staff(request)
         if err:
             return err
 
@@ -1326,7 +1429,7 @@ class ShellUIAdminLoginEventListView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        qs = LoginEvent.objects.all().select_related('user').order_by('-created_at', '-id')
+        qs = LoginEvent.objects.filter(company=company).select_related('user').order_by('-created_at', '-id')
 
         uid = request.GET.get('user_id')
         if uid is not None and str(uid).strip():
@@ -1416,11 +1519,11 @@ class ShellUIAdminLoginEventDetailView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request, pk):
-        _staff, err = _require_staff(request)
+        _staff, company, err = _require_staff(request)
         if err:
             return err
         try:
-            event = LoginEvent.objects.select_related('user').get(pk=pk)
+            event = LoginEvent.objects.select_related('user').get(pk=pk, company=company)
         except LoginEvent.DoesNotExist:
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
         return Response(_login_event_payload(event))
@@ -1442,9 +1545,33 @@ class ShellUIAdminMetricsView(APIView):
     renderer_classes = DEFAULT_METRICS_RENDERERS
 
     def get(self, request):
-        _staff, err = _require_staff(request)
+        _staff, company, err = _require_staff(request)
         if err:
             return err
+        return HttpResponse(
+            auth_metrics.metrics_http_body(company_id=company.id),
+            content_type=auth_metrics.METRICS_CONTENT_TYPE,
+        )
+
+
+@extend_schema_view(
+    get=extend_schema(
+        tags=['auth-admin'],
+        summary='Prometheus metrics for all companies (staff)',
+        description='Global Prometheus text exposition across all companies; staff users only.',
+        responses={200: OpenApiResponse(description='text/plain Prometheus exposition')},
+    ),
+)
+class ShellUIAdminGlobalMetricsView(APIView):
+    permission_classes = [AllowAny]
+    renderer_classes = DEFAULT_METRICS_RENDERERS
+
+    def get(self, request):
+        user = _authenticate_bearer_user(request)
+        if not user:
+            return Response({'error': 'Unauthorized'}, status=status.HTTP_401_UNAUTHORIZED)
+        if not user.is_staff:
+            return Response({'error': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
         return HttpResponse(
             auth_metrics.metrics_http_body(),
             content_type=auth_metrics.METRICS_CONTENT_TYPE,

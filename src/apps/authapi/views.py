@@ -1272,6 +1272,37 @@ class ShellUIAdminGroupDetailView(APIView):
                 required=False,
                 description='ISO 8601 datetime (exclusive upper bound).',
             ),
+            OpenApiParameter(
+                name='client_country',
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description='Case-insensitive substring match on GeoIP country (stored value).',
+            ),
+            OpenApiParameter(
+                name='client_city',
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description='Case-insensitive substring match on GeoIP city.',
+            ),
+            OpenApiParameter(
+                name='client_timezone',
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description='Case-insensitive substring match on client IANA timezone.',
+            ),
+            OpenApiParameter(
+                name='language',
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description=(
+                    "Filter rows where the user's saved ShellUI preference language matches "
+                    '(e.g. en, fr). Omits anonymous events (no user).'
+                ),
+            ),
             OpenApiParameter(name='page', type=int, location=OpenApiParameter.QUERY, required=False),
             OpenApiParameter(name='page_size', type=int, location=OpenApiParameter.QUERY, required=False),
         ],
@@ -1340,6 +1371,25 @@ class ShellUIAdminLoginEventListView(APIView):
             if not dt:
                 return Response({'error': 'Invalid created_before.'}, status=status.HTTP_400_BAD_REQUEST)
             qs = qs.filter(created_at__lt=dt)
+
+        cc = (request.GET.get('client_country') or '').strip()
+        if cc:
+            qs = qs.filter(client_country__icontains=cc)
+
+        city = (request.GET.get('client_city') or '').strip()
+        if city:
+            qs = qs.filter(client_city__icontains=city)
+
+        ctz = (request.GET.get('client_timezone') or '').strip()
+        if ctz:
+            qs = qs.filter(client_timezone__icontains=ctz)
+
+        lang = (request.GET.get('language') or '').strip().lower()
+        if lang:
+            allowed_lang = {choice[0] for choice in UserPreference.LANGUAGE_CHOICES}
+            if lang not in allowed_lang:
+                return Response({'error': 'Invalid language.'}, status=status.HTTP_400_BAD_REQUEST)
+            qs = qs.filter(user__preference__language=lang)
 
         total = qs.count()
         start = (page - 1) * page_size

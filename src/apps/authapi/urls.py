@@ -3,6 +3,8 @@ from django.urls import path
 from .views import (
     ShellUIAdminGroupDetailView,
     ShellUIAdminGroupListView,
+    ShellUIAdminLoginEventDetailView,
+    ShellUIAdminLoginEventListView,
     ShellUIAdminMetricsView,
     ShellUIAdminUserDetailView,
     ShellUIAdminUserListView,
@@ -27,6 +29,8 @@ urlpatterns = [
     path('admin/groups', ShellUIAdminGroupListView.as_view(), name='shellui-admin-groups'),
     path('admin/groups/<int:pk>', ShellUIAdminGroupDetailView.as_view(), name='shellui-admin-group-detail'),
     path('admin/users', ShellUIAdminUserListView.as_view(), name='shellui-admin-users'),
+    path('admin/login-events', ShellUIAdminLoginEventListView.as_view(), name='shellui-admin-login-events'),
+    path('admin/login-events/<int:pk>', ShellUIAdminLoginEventDetailView.as_view(), name='shellui-admin-login-event-detail'),
     path('admin/metrics', ShellUIAdminMetricsView.as_view(), name='shellui-admin-metrics'),
     path('admin/users/<int:pk>', ShellUIAdminUserDetailView.as_view(), name='shellui-admin-user-detail'),
     path('preferences', ShellUIPreferenceView.as_view(), name='shellui-preferences'),

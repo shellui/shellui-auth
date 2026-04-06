@@ -6,8 +6,10 @@ from urllib.parse import urlencode
 from django.conf import settings
 from django.core.cache import cache
 from django.http import HttpResponse, HttpResponseRedirect
+from django.utils.dateparse import parse_datetime
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
+from django.contrib.auth.signals import user_logged_in
 from django.db.models import Count, Q
 from django.db.utils import OperationalError, ProgrammingError
 from allauth.socialaccount.models import SocialApp, SocialAccount
@@ -22,7 +24,8 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from . import metrics as auth_metrics
 from .renderers import DEFAULT_METRICS_RENDERERS
-from .models import UserPreference
+from .login_audit import oauth_callback_url, record_login_event
+from .models import LoginEvent, UserPreference
 from .oauth import build_authorize_url, exchange_code_for_token, fetch_provider_userinfo, get_provider_config
 from .serializers import (
     ProviderAuthorizeSerializer,
@@ -35,6 +38,15 @@ from .serializers import (
 
 User = get_user_model()
 FRONTEND_DEFAULT_REDIRECT_PATH = '/login/callback'
+
+
+def _notify_user_logged_in_for_oauth(request, user: User) -> None:
+    """
+    OAuth success paths do not call django.contrib.auth.login(), so Django never emits
+    user_logged_in and last_login stays stale. Fire the same signal so built-in
+    update_last_login runs (and any other user_logged_in receivers).
+    """
+    user_logged_in.send(sender=user.__class__, request=request, user=user)
 
 
 def _user_preferences_payload(user: User) -> dict:
@@ -286,6 +298,25 @@ def _require_staff(request):
     return user, None
 
 
+def _login_event_payload(event: LoginEvent) -> dict:
+    return {
+        'id': event.id,
+        'created_at': event.created_at,
+        'user_id': event.user_id,
+        'user_email': event.user.email if event.user_id else None,
+        'outcome': event.outcome,
+        'provider': event.provider,
+        'failure_reason': event.failure_reason or '',
+        'is_staff_at_event': event.is_staff_at_event,
+        'ip_hash': event.ip_hash or '',
+        'user_agent': event.user_agent or '',
+        'client_timezone': event.client_timezone or '',
+        'client_device_id_hash': event.client_device_id_hash or '',
+        'client_country': event.client_country or '',
+        'client_city': event.client_city or '',
+    }
+
+
 def _admin_user_payload(user: User) -> dict:
     cache_key = f"shellui:user_metadata:{user.id}"
     user_metadata = cache.get(cache_key) or {
@@ -348,6 +379,8 @@ class SocialLoginView(APIView):
         serializer = ProviderCallbackSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
+        client_tz = serializer.validated_data.get('client_timezone') or ''
+        client_dev = serializer.validated_data.get('client_device_id') or None
         try:
             access_token = exchange_code_for_token(
                 provider=provider,
@@ -357,6 +390,15 @@ class SocialLoginView(APIView):
             userinfo = fetch_provider_userinfo(provider, access_token)
             provider_id, email, full_name, _avatar_url = _extract_user_data(provider, userinfo, access_token)
         except Exception as exc:
+            record_login_event(
+                request=request,
+                outcome=LoginEvent.OUTCOME_FAILURE,
+                provider=provider,
+                user=None,
+                failure_reason=str(exc),
+                client_timezone=client_tz,
+                client_device_id=client_dev,
+            )
             return Response(
                 {'detail': str(exc)},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -378,7 +420,16 @@ class SocialLoginView(APIView):
             user.save(update_fields=['first_name', 'last_name'])
         _link_social_account(user=user, provider=provider, provider_id=provider_id, userinfo=userinfo)
 
+        _notify_user_logged_in_for_oauth(request, user)
         auth_metrics.record_successful_login(provider)
+        record_login_event(
+            request=request,
+            outcome=LoginEvent.OUTCOME_SUCCESS,
+            provider=provider,
+            user=user,
+            client_timezone=client_tz,
+            client_device_id=client_dev,
+        )
         token_payload = _issue_tokens(user)
         return Response(token_payload, status=status.HTTP_200_OK)
 
@@ -438,6 +489,25 @@ class ShellUIAuthSettingsView(APIView):
                 required=False,
                 description='Frontend callback URL. Defaults to /login/callback on current host.',
             ),
+            OpenApiParameter(
+                name='client_timezone',
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description=(
+                    'Optional IANA timezone from the browser (e.g. Europe/Paris), e.g. from '
+                    'Intl.DateTimeFormat().resolvedOptions().timeZone. Stored as a coarse hint only.'
+                ),
+            ),
+            OpenApiParameter(
+                name='client_device_id',
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description=(
+                    'Optional first-party device id (e.g. UUID in localStorage). Sent only as hashed value.'
+                ),
+            ),
         ],
         responses={
             302: OpenApiResponse(description='Redirect to provider authorize URL'),
@@ -470,10 +540,8 @@ class ShellUIAuthorizeView(APIView):
                 },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
-        callback_url = (
-            f"{request.scheme}://{request.get_host()}/auth/v1/oauth/callback?"
-            f"provider={provider}&redirect_to={_resolve_redirect_to(request)}"
-        )
+        redirect_to = _resolve_redirect_to(request)
+        callback_url = oauth_callback_url(request, provider, redirect_to)
         authorize_url = build_authorize_url(provider=provider, redirect_uri=callback_url)
         return HttpResponseRedirect(authorize_url)
 
@@ -508,6 +576,20 @@ class ShellUIAuthorizeView(APIView):
                 required=False,
                 description='Frontend callback URL. Defaults to /login/callback on current host.',
             ),
+            OpenApiParameter(
+                name='client_timezone',
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description='Optional IANA timezone echoed from the authorize step.',
+            ),
+            OpenApiParameter(
+                name='client_device_id',
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description='Optional device id echoed from the authorize step.',
+            ),
         ],
         responses={
             302: OpenApiResponse(description='Redirect to frontend with auth payload in URL fragment'),
@@ -524,15 +606,23 @@ class ShellUIOAuthCallbackView(APIView):
         redirect_to = _resolve_redirect_to(request)
         if not provider or not code:
             return Response({'error': 'Missing provider or code.'}, status=status.HTTP_400_BAD_REQUEST)
-        callback_url = (
-            f"{request.scheme}://{request.get_host()}/auth/v1/oauth/callback?"
-            f"provider={provider}&redirect_to={redirect_to}"
-        )
+        callback_url = oauth_callback_url(request, provider, redirect_to)
+        client_tz = request.GET.get('client_timezone', '')
+        client_dev = request.GET.get('client_device_id', '') or None
         try:
             access_token = exchange_code_for_token(provider=provider, code=code, redirect_uri=callback_url)
             userinfo = fetch_provider_userinfo(provider, access_token)
             provider_id, email, full_name, avatar_url = _extract_user_data(provider, userinfo, access_token)
         except Exception as exc:
+            record_login_event(
+                request=request,
+                outcome=LoginEvent.OUTCOME_FAILURE,
+                provider=provider,
+                user=None,
+                failure_reason=str(exc),
+                client_timezone=client_tz,
+                client_device_id=client_dev,
+            )
             return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         user, created = User.objects.get_or_create(
@@ -560,8 +650,17 @@ class ShellUIOAuthCallbackView(APIView):
             },
             timeout=60 * 60 * 24 * 30,
         )
+        _notify_user_logged_in_for_oauth(request, user)
         payload = _issue_shellui_tokens(user, avatar_url=avatar_url, oauth_provider=provider)
         auth_metrics.record_successful_login(provider)
+        record_login_event(
+            request=request,
+            outcome=LoginEvent.OUTCOME_SUCCESS,
+            provider=provider,
+            user=user,
+            client_timezone=client_tz,
+            client_device_id=client_dev,
+        )
         return HttpResponseRedirect(_build_callback_redirect(redirect_to, payload, provider=provider))
 
 
@@ -1075,6 +1174,162 @@ class ShellUIAdminGroupDetailView(APIView):
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
         g.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+@extend_schema_view(
+    get=extend_schema(
+        tags=['auth-admin'],
+        summary='List login audit events (staff)',
+        description=(
+            'Paginated OAuth sign-in attempts (success and failure). '
+            'Contains privacy-oriented fields (hashed IP, truncated user-agent). '
+            'Requires staff JWT.'
+        ),
+        parameters=[
+            OpenApiParameter(
+                name='user_id',
+                type=int,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description='Filter by Django user id.',
+            ),
+            OpenApiParameter(
+                name='outcome',
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description='success or failure.',
+            ),
+            OpenApiParameter(
+                name='provider',
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description='OAuth provider slug (github, google, microsoft).',
+            ),
+            OpenApiParameter(
+                name='is_staff_at_event',
+                type=bool,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description='Filter rows where the user was staff at login time.',
+            ),
+            OpenApiParameter(
+                name='created_after',
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description='ISO 8601 datetime (inclusive lower bound).',
+            ),
+            OpenApiParameter(
+                name='created_before',
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description='ISO 8601 datetime (exclusive upper bound).',
+            ),
+            OpenApiParameter(name='page', type=int, location=OpenApiParameter.QUERY, required=False),
+            OpenApiParameter(name='page_size', type=int, location=OpenApiParameter.QUERY, required=False),
+        ],
+        responses={200: OpenApiResponse(description='Paginated list of login audit events')},
+    ),
+)
+class ShellUIAdminLoginEventListView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        _staff, err = _require_staff(request)
+        if err:
+            return err
+
+        try:
+            page = max(1, int(request.GET.get('page') or 1))
+            page_size = min(100, max(1, int(request.GET.get('page_size') or 20)))
+        except (TypeError, ValueError):
+            return Response(
+                {'error': 'Invalid page or page_size.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        qs = LoginEvent.objects.all().select_related('user').order_by('-created_at', '-id')
+
+        uid = request.GET.get('user_id')
+        if uid is not None and str(uid).strip():
+            try:
+                qs = qs.filter(user_id=int(uid))
+            except (TypeError, ValueError):
+                return Response({'error': 'Invalid user_id.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        outcome = (request.GET.get('outcome') or '').strip().lower()
+        if outcome:
+            if outcome not in (LoginEvent.OUTCOME_SUCCESS, LoginEvent.OUTCOME_FAILURE):
+                return Response({'error': 'Invalid outcome.'}, status=status.HTTP_400_BAD_REQUEST)
+            qs = qs.filter(outcome=outcome)
+
+        prov = (request.GET.get('provider') or '').strip().lower()
+        if prov:
+            qs = qs.filter(provider=prov)
+
+        staff_raw = request.GET.get('is_staff_at_event')
+        if staff_raw is not None and str(staff_raw).strip() != '':
+            s = str(staff_raw).strip().lower()
+            if s in ('1', 'true', 'yes'):
+                qs = qs.filter(is_staff_at_event=True)
+            elif s in ('0', 'false', 'no'):
+                qs = qs.filter(is_staff_at_event=False)
+            else:
+                return Response(
+                    {'error': 'Invalid is_staff_at_event (use true or false).'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        ca = (request.GET.get('created_after') or '').strip()
+        if ca:
+            dt = parse_datetime(ca)
+            if not dt:
+                return Response({'error': 'Invalid created_after.'}, status=status.HTTP_400_BAD_REQUEST)
+            qs = qs.filter(created_at__gte=dt)
+
+        cb = (request.GET.get('created_before') or '').strip()
+        if cb:
+            dt = parse_datetime(cb)
+            if not dt:
+                return Response({'error': 'Invalid created_before.'}, status=status.HTTP_400_BAD_REQUEST)
+            qs = qs.filter(created_at__lt=dt)
+
+        total = qs.count()
+        start = (page - 1) * page_size
+        rows = [_login_event_payload(e) for e in qs[start : start + page_size]]
+        return Response(
+            {
+                'count': total,
+                'page': page,
+                'page_size': page_size,
+                'results': rows,
+            }
+        )
+
+
+@extend_schema_view(
+    get=extend_schema(
+        tags=['auth-admin'],
+        summary='Retrieve login audit event (staff)',
+        description='Single login event row. Requires staff JWT.',
+        responses={200: OpenApiResponse(description='Login audit event')},
+    ),
+)
+class ShellUIAdminLoginEventDetailView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, pk):
+        _staff, err = _require_staff(request)
+        if err:
+            return err
+        try:
+            event = LoginEvent.objects.select_related('user').get(pk=pk)
+        except LoginEvent.DoesNotExist:
+            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(_login_event_payload(event))
 
 
 @extend_schema_view(

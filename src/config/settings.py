@@ -125,6 +125,10 @@ GOOGLE_CLIENT_SECRET = os.getenv('GOOGLE_CLIENT_SECRET', '')
 MICROSOFT_CLIENT_ID = os.getenv('MICROSOFT_CLIENT_ID', '')
 MICROSOFT_CLIENT_SECRET = os.getenv('MICROSOFT_CLIENT_SECRET', '')
 
+# Optional MaxMind GeoLite2/GeoIP2 City database (.mmdb) for login audit country/city.
+# Install: pip install geoip2  — then set path to your .mmdb file.
+SHELLUI_GEOIP_DATABASE_PATH = os.getenv('SHELLUI_GEOIP_DATABASE_PATH', '')
+
 SOCIALACCOUNT_PROVIDERS = {
     'github': {
         'APPS': [

@@ -1,3 +1,5 @@
+from urllib.parse import urlsplit
+
 from rest_framework import serializers
 
 
@@ -40,6 +42,40 @@ class ShellUIAdminGroupCreateSerializer(serializers.Serializer):
 
 class ShellUIAdminGroupUpdateSerializer(serializers.Serializer):
     name = serializers.CharField(max_length=150)
+
+
+class ShellUIAdminLoginRedirectCreateSerializer(serializers.Serializer):
+    base_url = serializers.CharField(max_length=500)
+    label = serializers.CharField(required=False, allow_blank=True, max_length=150)
+
+    def validate_base_url(self, value: str) -> str:
+        v = (value or '').strip()
+        if v.startswith('//'):
+            raise serializers.ValidationError('Must be an absolute http(s) URL.')
+        p = urlsplit(v)
+        if p.scheme not in ('http', 'https') or not p.netloc:
+            raise serializers.ValidationError('Must be an absolute http(s) URL.')
+        return v
+
+
+class ShellUIAdminLoginRedirectUpdateSerializer(serializers.Serializer):
+    base_url = serializers.CharField(required=False, allow_blank=False, max_length=500)
+    label = serializers.CharField(required=False, allow_blank=True, max_length=150)
+    is_active = serializers.BooleanField(required=False)
+
+    def validate(self, attrs: dict) -> dict:
+        if not attrs:
+            raise serializers.ValidationError('Provide at least one of: base_url, label, is_active.')
+        return attrs
+
+    def validate_base_url(self, value: str) -> str:
+        v = (value or '').strip()
+        if v.startswith('//'):
+            raise serializers.ValidationError('Must be an absolute http(s) URL.')
+        p = urlsplit(v)
+        if p.scheme not in ('http', 'https') or not p.netloc:
+            raise serializers.ValidationError('Must be an absolute http(s) URL.')
+        return v
 
 
 class ShellUIAdminLoginEventSerializer(serializers.Serializer):

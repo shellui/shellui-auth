@@ -10,6 +10,7 @@ from django.http import HttpResponse, HttpResponseRedirect
 from django.utils.dateparse import parse_datetime
 from django.contrib.auth import get_user_model
 from django.contrib.auth.signals import user_logged_in
+from django.db import IntegrityError
 from django.db.models import Count, Q
 from django.db.utils import OperationalError, ProgrammingError
 from allauth.socialaccount.models import SocialApp, SocialAccount
@@ -23,7 +24,11 @@ from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from . import metrics as auth_metrics
-from apps.companies.models import Company, CompanyGroup
+from apps.companies.models import Company, CompanyGroup, CompanyOAuthRedirect
+from apps.companies.redirect_allowlist import (
+    loopback_client_bounce_url_for_oauth_error,
+    validate_redirect_to_for_company,
+)
 from .renderers import DEFAULT_METRICS_RENDERERS
 from .login_audit import oauth_callback_url, record_login_event
 from .models import LoginEvent, UserPreference
@@ -34,12 +39,13 @@ from .serializers import (
     ProviderCallbackSerializer,
     ShellUIAdminGroupCreateSerializer,
     ShellUIAdminGroupUpdateSerializer,
+    ShellUIAdminLoginRedirectCreateSerializer,
+    ShellUIAdminLoginRedirectUpdateSerializer,
     ShellUIAdminUserUpdateSerializer,
     UserPreferenceSerializer,
 )
 
 User = get_user_model()
-FRONTEND_DEFAULT_REDIRECT_PATH = '/login/callback'
 
 # Client-supplied user_metadata merges cannot set these; they are derived from Django / company state.
 _SHELLUI_JWT_PRIVILEGED_METADATA_KEYS = frozenset({'is_staff', 'is_company_owner', 'groups'})
@@ -310,11 +316,28 @@ def _build_callback_redirect(redirect_to: str, payload: dict, provider: str) -> 
     return f"{redirect_to}#{urlencode(params)}"
 
 
-def _resolve_redirect_to(request) -> str:
-    redirect_to = request.GET.get('redirect_to', '').strip()
-    if redirect_to:
-        return redirect_to
-    return f"{request.scheme}://{request.get_host()}{FRONTEND_DEFAULT_REDIRECT_PATH}"
+def _shellui_oauth_bounce_or_json(
+    request,
+    *,
+    message: str,
+    status_code: int = status.HTTP_400_BAD_REQUEST,
+    error_code: str = 'oauth_authorize_failed',
+    redirect_to_raw: str | None = None,
+):
+    """
+    For loopback `redirect_to` targets, redirect back to the Shell app with `shellui_oauth_error`
+    query params so the UI can render the message. Otherwise return JSON (e.g. production).
+    """
+    raw = redirect_to_raw if redirect_to_raw is not None else request.GET.get('redirect_to')
+    bounce = loopback_client_bounce_url_for_oauth_error(
+        request,
+        raw,
+        message,
+        error_code=error_code,
+    )
+    if bounce:
+        return HttpResponseRedirect(bounce)
+    return Response({'error': message}, status=status_code)
 
 
 def _authenticate_bearer_user(request):
@@ -381,6 +404,16 @@ def _require_staff_or_company_owner(request):
     if user.is_staff or _is_user_company_owner(user, company):
         return user, company, None
     return None, None, Response({'error': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+
+
+def _login_redirect_payload(row: CompanyOAuthRedirect) -> dict:
+    return {
+        'id': row.id,
+        'base_url': row.base_url,
+        'label': row.label,
+        'is_active': row.is_active,
+        'created_at': row.created_at,
+    }
 
 
 def _login_event_payload(event: LoginEvent) -> dict:
@@ -635,28 +668,61 @@ class ShellUIAuthorizeView(APIView):
     def get(self, request):
         _company, company_err = _required_company_from_request(request)
         if company_err:
+            msg = 'Invalid request.'
+            data = getattr(company_err, 'data', None)
+            if isinstance(data, dict):
+                msg = str(data.get('error') or msg)
+            bounced = _shellui_oauth_bounce_or_json(
+                request,
+                message=msg,
+                status_code=getattr(company_err, 'status_code', status.HTTP_400_BAD_REQUEST)
+                or status.HTTP_400_BAD_REQUEST,
+                error_code='authorize_company',
+            )
+            if isinstance(bounced, HttpResponseRedirect):
+                return bounced
             return company_err
         provider = request.GET.get('provider', '').strip().lower()
         if not provider:
-            return Response({'error': 'Missing provider parameter.'}, status=status.HTTP_400_BAD_REQUEST)
+            return _shellui_oauth_bounce_or_json(
+                request,
+                message='Missing provider parameter.',
+                error_code='missing_provider',
+            )
         if provider not in _enabled_oauth_providers():
-            return Response(
-                {'error': f"Provider '{provider}' is not enabled."},
-                status=status.HTTP_400_BAD_REQUEST,
+            return _shellui_oauth_bounce_or_json(
+                request,
+                message=f"Provider '{provider}' is not enabled.",
+                error_code='provider_disabled',
             )
         cfg = get_provider_config(provider)
         if not str(cfg.client_id).strip() or not str(cfg.client_secret).strip():
-            return Response(
-                {
-                    'error': (
-                        f"Provider '{provider}' is missing OAuth credentials. "
-                        f"Set {provider.upper()}_CLIENT_ID/{provider.upper()}_CLIENT_SECRET "
-                        f"or configure an allauth SocialApp with client id + secret."
-                    )
-                },
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            return _shellui_oauth_bounce_or_json(
+                request,
+                message=(
+                    f"Provider '{provider}' is missing OAuth credentials. "
+                    f"Set {provider.upper()}_CLIENT_ID/{provider.upper()}_CLIENT_SECRET "
+                    f"or configure an allauth SocialApp with client id + secret."
+                ),
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                error_code='provider_oauth_misconfigured',
             )
-        redirect_to = _resolve_redirect_to(request)
+        redirect_to, rerr = validate_redirect_to_for_company(
+            company=_company,
+            request=request,
+            redirect_to_raw=request.GET.get('redirect_to'),
+        )
+        if rerr or not redirect_to:
+            err_code = (
+                'redirect_not_allowed'
+                if rerr and 'not allowed' in rerr
+                else 'invalid_redirect'
+            )
+            return _shellui_oauth_bounce_or_json(
+                request,
+                message=rerr or 'Invalid redirect.',
+                error_code=err_code,
+            )
         callback_url = oauth_callback_url(request, provider, redirect_to)
         authorize_url = build_authorize_url(provider=provider, redirect_uri=callback_url)
         return HttpResponseRedirect(authorize_url)
@@ -719,12 +785,44 @@ class ShellUIOAuthCallbackView(APIView):
     def get(self, request):
         company, company_err = _required_company_from_request(request)
         if company_err:
+            msg = 'Invalid request.'
+            data = getattr(company_err, 'data', None)
+            if isinstance(data, dict):
+                msg = str(data.get('error') or msg)
+            bounced = _shellui_oauth_bounce_or_json(
+                request,
+                message=msg,
+                status_code=getattr(company_err, 'status_code', status.HTTP_400_BAD_REQUEST)
+                or status.HTTP_400_BAD_REQUEST,
+                error_code='callback_company',
+            )
+            if isinstance(bounced, HttpResponseRedirect):
+                return bounced
             return company_err
         provider = request.GET.get('provider', '').strip().lower()
         code = request.GET.get('code', '').strip()
-        redirect_to = _resolve_redirect_to(request)
+        redirect_to, rerr = validate_redirect_to_for_company(
+            company=company,
+            request=request,
+            redirect_to_raw=request.GET.get('redirect_to'),
+        )
+        if rerr or not redirect_to:
+            err_code = (
+                'redirect_not_allowed'
+                if rerr and 'not allowed' in rerr
+                else 'invalid_redirect'
+            )
+            return _shellui_oauth_bounce_or_json(
+                request,
+                message=rerr or 'Invalid redirect.',
+                error_code=err_code,
+            )
         if not provider or not code:
-            return Response({'error': 'Missing provider or code.'}, status=status.HTTP_400_BAD_REQUEST)
+            return _shellui_oauth_bounce_or_json(
+                request,
+                message='Missing provider or code.',
+                error_code='missing_provider_or_code',
+            )
         callback_url = oauth_callback_url(request, provider, redirect_to)
         client_tz = request.GET.get('client_timezone', '')
         client_dev = request.GET.get('client_device_id', '') or None
@@ -743,6 +841,13 @@ class ShellUIOAuthCallbackView(APIView):
                 client_timezone=client_tz,
                 client_device_id=client_dev,
             )
+            bounced = _shellui_oauth_bounce_or_json(
+                request,
+                message=str(exc),
+                error_code='token_exchange_failed',
+            )
+            if isinstance(bounced, HttpResponseRedirect):
+                return bounced
             return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         user, created = User.objects.get_or_create(
@@ -1360,6 +1465,120 @@ class ShellUIAdminGroupDetailView(APIView):
         except CompanyGroup.DoesNotExist:
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
         g.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+@extend_schema_view(
+    get=extend_schema(
+        tags=['auth-admin'],
+        summary='List OAuth login redirect allow list (staff or company owner)',
+        description=(
+            'Allowed absolute URL prefixes for browser OAuth (`redirect_to`). '
+            'The auth server default callback for this host is always permitted without a row.'
+        ),
+    ),
+    post=extend_schema(
+        tags=['auth-admin'],
+        summary='Add allowed OAuth redirect prefix (staff or company owner)',
+        request=ShellUIAdminLoginRedirectCreateSerializer,
+    ),
+)
+class ShellUIAdminLoginRedirectListView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        _actor, company, err = _require_staff_or_company_owner(request)
+        if err:
+            return err
+        rows = CompanyOAuthRedirect.objects.filter(company=company).order_by('id')
+        return Response([_login_redirect_payload(r) for r in rows])
+
+    def post(self, request):
+        _actor, company, err = _require_staff_or_company_owner(request)
+        if err:
+            return err
+        serializer = ShellUIAdminLoginRedirectCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        base_url = serializer.validated_data['base_url']
+        label = serializer.validated_data.get('label') or ''
+        try:
+            row = CompanyOAuthRedirect.objects.create(
+                company=company,
+                base_url=base_url,
+                label=label,
+            )
+        except IntegrityError:
+            return Response(
+                {'error': 'This base_url is already registered for this company.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(_login_redirect_payload(row), status=status.HTTP_201_CREATED)
+
+
+@extend_schema_view(
+    get=extend_schema(
+        tags=['auth-admin'],
+        summary='Retrieve OAuth login redirect rule (staff or company owner)',
+    ),
+    put=extend_schema(
+        tags=['auth-admin'],
+        summary='Update OAuth login redirect rule (staff or company owner)',
+        request=ShellUIAdminLoginRedirectUpdateSerializer,
+    ),
+    delete=extend_schema(
+        tags=['auth-admin'],
+        summary='Delete OAuth login redirect rule (staff or company owner)',
+    ),
+)
+class ShellUIAdminLoginRedirectDetailView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, pk):
+        _actor, company, err = _require_staff_or_company_owner(request)
+        if err:
+            return err
+        try:
+            row = CompanyOAuthRedirect.objects.get(pk=pk, company=company)
+        except CompanyOAuthRedirect.DoesNotExist:
+            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(_login_redirect_payload(row))
+
+    def put(self, request, pk):
+        _actor, company, err = _require_staff_or_company_owner(request)
+        if err:
+            return err
+        try:
+            row = CompanyOAuthRedirect.objects.get(pk=pk, company=company)
+        except CompanyOAuthRedirect.DoesNotExist:
+            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        serializer = ShellUIAdminLoginRedirectUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        validated = serializer.validated_data
+        if 'base_url' in validated:
+            row.base_url = validated['base_url']
+        if 'label' in validated:
+            row.label = validated['label']
+        if 'is_active' in validated:
+            row.is_active = validated['is_active']
+        try:
+            row.save()
+        except IntegrityError:
+            return Response(
+                {'error': 'This base_url is already registered for this company.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        row.refresh_from_db()
+        return Response(_login_redirect_payload(row))
+
+    def delete(self, request, pk):
+        _actor, company, err = _require_staff_or_company_owner(request)
+        if err:
+            return err
+        try:
+            row = CompanyOAuthRedirect.objects.get(pk=pk, company=company)
+        except CompanyOAuthRedirect.DoesNotExist:
+            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        row.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 

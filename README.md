@@ -1,6 +1,6 @@
-# shellui-auth
+# identity-service
 
-`shellui-auth` is a Django backend that provides authentication endpoints compatible with ShellUI (`backend.type = "shellui"`).
+`identity-service` is a Django backend that provides authentication endpoints compatible with ShellUI (`backend.type = "shellui"`).
 
 It supports OAuth login (GitHub/Google/Microsoft), issues JWT tokens, exposes Supabase-like auth routes under `/auth/v1/*`, and returns user metadata that ShellUI can use (including avatar URL).
 

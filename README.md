@@ -117,7 +117,7 @@ Homepage / application URL may still be the shell (e.g. `http://localhost:4000`)
 
 Also allowlist each shell **origin** for the company (e.g. `http://localhost:4000`, `https://app.example.com`) via Django admin → Company OAuth redirects, Shellui admin OAuth setup, or `POST /api/v1/oauth-redirects`. Loopback (`127.0.0.1` / `localhost`) is always allowed for `shellui login` / CLI.
 
-Full flow, allowlist rules, and upgrade steps: [docs/oauth-login.md](docs/oauth-login.md).
+Full flow, allowlist rules, hosting sync, and upgrade steps (including **0.4.1**): [docs/oauth-login.md](docs/oauth-login.md).
 
 ## Notes
 

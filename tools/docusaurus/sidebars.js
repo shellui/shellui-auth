@@ -28,6 +28,11 @@ const sidebars = {
       id: 'metrics',
       label: 'Metrics',
     },
+    {
+      type: 'doc',
+      id: 'RELEASES',
+      label: 'Releases',
+    },
   ],
 };
 

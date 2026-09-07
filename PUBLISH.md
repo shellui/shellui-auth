@@ -37,11 +37,11 @@ Manual equivalents (if you are not using the script):
 
 ### 1. Version alignment
 
-Ensure these match the release version (e.g. `0.3.0`):
+Ensure these match the release version (e.g. `0.4.1`):
 
 - `version` in `pyproject.toml` (OpenAPI / API metadata via `config.settings.VERSION`)
 - `CHANGELOG.md` entry with date
-- Git tag `v0.4.0` (optional but recommended; not enforced by the script)
+- Git tag `v0.4.1` (optional but recommended; not enforced by the script)
 - CI green on the release commit (`.github/workflows/ci.yml` + pre-release workflow)
 
 ### 2. No secrets in the build context
@@ -65,7 +65,7 @@ Covered by `./tools/pre-release-check.sh`. Manual form:
 export SECRET_KEY="$(uv run python -c "from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())")"
 eval "$(uv run python manage.py generate_jwt_keys --shell)"
 
-VERSION=0.3.0
+VERSION=0.4.1
 docker build -t "shellui/identity-service:${VERSION}" .
 
 docker run --rm -d --name identity-release-smoke -p 18000:8000 \
@@ -95,12 +95,12 @@ docker login
 
 ### Tagging
 
-For semver release `0.3.0`, typical Docker Hub tags:
+For semver release `0.4.1`, typical Docker Hub tags:
 
 | Tag      | Purpose                                  |
 | -------- | ---------------------------------------- |
-| `0.3.0`  | Exact release (pin in production)        |
-| `0.3`    | Latest patch in the 0.3 line             |
+| `0.4.1`  | Exact release (pin in production)        |
+| `0.4`    | Latest patch in the 0.4 line             |
 | `latest` | Newest published release (use with care) |
 
 ### Option A — single platform (fastest, not recommended, see option B)
@@ -108,16 +108,16 @@ For semver release `0.3.0`, typical Docker Hub tags:
 From the repository root:
 
 ```bash
-VERSION=0.3.0
+VERSION=0.4.1
 IMAGE=shellui/identity-service
 
 docker build -t "${IMAGE}:${VERSION}" .
 docker push "${IMAGE}:${VERSION}"
 
 # Optional extra tags
-docker tag "${IMAGE}:${VERSION}" "${IMAGE}:0.3"
+docker tag "${IMAGE}:${VERSION}" "${IMAGE}:0.4"
 docker tag "${IMAGE}:${VERSION}" "${IMAGE}:latest"
-docker push "${IMAGE}:0.3"
+docker push "${IMAGE}:0.4"
 docker push "${IMAGE}:latest"
 ```
 
@@ -126,7 +126,7 @@ docker push "${IMAGE}:latest"
 If you build on Apple Silicon, a plain `docker build` may produce `linux/arm64` only. Most cloud VMs expect `linux/amd64`. Publish both with buildx:
 
 ```bash
-VERSION=0.3.0
+VERSION=0.4.1
 IMAGE=shellui/identity-service
 
 docker buildx create --use --name multi 2>/dev/null || docker buildx use multi
@@ -141,7 +141,7 @@ docker buildx build \
 ### Git tag (recommended)
 
 ```bash
-VERSION=0.3.0
+VERSION=0.4.1
 git tag -a "v${VERSION}" -m "Release ${VERSION}"
 git push origin "v${VERSION}"
 ```
@@ -161,7 +161,7 @@ docker run -d \
   -e JWT_PRIVATE_KEY='replace-with-pem-from-generate_jwt_keys' \
   -e ALLOWED_HOSTS='auth.example.com' \
   -e CSRF_TRUSTED_ORIGINS='https://auth.example.com,https://app.example.com' \
-  shellui/identity-service:0.3.0
+  shellui/identity-service:0.4.1
 ```
 
 The entrypoint runs migrations on start, then starts Gunicorn as user `appuser`.

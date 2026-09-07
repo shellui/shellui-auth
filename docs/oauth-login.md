@@ -84,7 +84,9 @@ Do **not** add every hosting preview slug to `CORS_ALLOWED_ORIGINS`. Preview log
 
 Company join rules (`public` / `domain` / `invite`) still apply after a successful provider login — see [company-access.md](company-access.md).
 
-## Upgrading from shell-hosted callbacks
+## Upgrading
+
+### From shell-hosted callbacks (pre-0.4.0)
 
 If you previously registered `{shell}/login/callback` on GitHub, Google, or Microsoft:
 
@@ -92,3 +94,9 @@ If you previously registered `{shell}/login/callback` on GitHub, Google, or Micr
 2. Add every production shell origin to the company redirect allowlist.
 3. Deploy identity-service with migration `0013_companyoauthredirect` (runs automatically on container start).
 4. Prefer a Shellui / admin build that shows the identity callback in OAuth setup.
+
+### To 0.4.1 (hosting sync + permissive CORS)
+
+1. Deploy identity-service so migration `0014_companyoauthredirect_source` runs (adds `source` on `CompanyOAuthRedirect`; existing rows default to `manual`).
+2. Keep `CORS_ALLOW_ALL_ORIGINS=true` unless you intentionally lock down API origins; do **not** enumerate hosting preview slugs in `CORS_ALLOWED_ORIGINS`.
+3. Ensure hosting-service can reach `PUT`/`DELETE /api/v1/hosting-oauth-redirects` with the deployer's identity JWT so preview origins stay on the redirect allowlist.

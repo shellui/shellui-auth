@@ -12,7 +12,7 @@ For day-to-day local runs, see the **Docker (local run)** section in the reposit
 | ---------------- | --------------------------------------------------------- |
 | Registry         | Docker Hub                                                |
 | Repository       | `shellui/identity-service`                                |
-| Recommended tags | `0.3.0`, `0.3`, `latest` (see [Tagging](#tagging))        |
+| Recommended tags | `0.4.1`, `0.4`, `latest` (see [Tagging](#tagging))        |
 | Listen port      | `8000`                                                    |
 | Data volume      | `/app/data` (SQLite default path: `/app/data/db.sqlite3`) |
 
@@ -30,12 +30,12 @@ See [PUBLISH.md](https://github.com/shellui/identity-service/blob/main/PUBLISH.m
 
 ### 1. Version alignment
 
-Ensure these match the release version (e.g. `0.4.0`):
+Ensure these match the release version (e.g. `0.4.1`):
 
 - `version` in `pyproject.toml` (OpenAPI / API metadata via `config.settings.VERSION`)
 - `CHANGELOG.md` entry with date
 - CI + pre-release workflows green on the release commit
-- Git tag `v0.4.0` (optional but recommended; not enforced by the script)
+- Git tag `v0.4.1` (optional but recommended; not enforced by the script)
 
 ### 2. No secrets in the build context
 
@@ -75,13 +75,13 @@ export SECRET_KEY="$(uv run python -c "from django.core.management.utils import 
 export JWT_PRIVATE_KEY="$(uv run python manage.py generate_jwt_keys 2>/dev/null | awk -F'\"' '/JWT_PRIVATE_KEY=/ {print $2}')"
 # Or set JWT_PRIVATE_KEY from output of: uv run python manage.py generate_jwt_keys
 
-docker build -t shellui/identity-service:0.3.0 .
+docker build -t shellui/identity-service:0.4.1 .
 
 docker run --rm -d --name identity-release-smoke -p 18000:8000 \
   -e SECRET_KEY \
   -e JWT_PRIVATE_KEY \
   -e ALLOWED_HOSTS=localhost,127.0.0.1 \
-  shellui/identity-service:0.3.0
+  shellui/identity-service:0.4.1
 
 # Expect HTTP response (400 with company_id is fine — proves Gunicorn + Django are up)
 curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:18000/api/v1/settings
@@ -101,38 +101,38 @@ docker buildx create --use --name multi 2>/dev/null || docker buildx use multi
 
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
-  -t shellui/identity-service:0.3.0 \
+  -t shellui/identity-service:0.4.1 \
   --push .
 ```
 
 For a quick single-platform push from your machine:
 
 ```bash
-docker build -t shellui/identity-service:0.3.0 .
-docker push shellui/identity-service:0.3.0
+docker build -t shellui/identity-service:0.4.1 .
+docker push shellui/identity-service:0.4.1
 ```
 
 ## Tagging
 
-For semver release `0.3.0`, typical Docker Hub tags:
+For semver release `0.4.1`, typical Docker Hub tags:
 
 | Tag      | Purpose                                  |
 | -------- | ---------------------------------------- |
-| `0.3.0`  | Exact release (pin in production)        |
-| `0.3`    | Latest patch in 0.3 line                 |
+| `0.4.1`  | Exact release (pin in production)        |
+| `0.4`    | Latest patch in 0.4 line                 |
 | `latest` | Newest published release (use with care) |
 
 Example:
 
 ```bash
-VERSION=0.3.0
+VERSION=0.4.1
 IMAGE=shellui/identity-service
 
-docker tag "${IMAGE}:${VERSION}" "${IMAGE}:0.3"
+docker tag "${IMAGE}:${VERSION}" "${IMAGE}:0.4"
 docker tag "${IMAGE}:${VERSION}" "${IMAGE}:latest"
 
 docker push "${IMAGE}:${VERSION}"
-docker push "${IMAGE}:0.3"
+docker push "${IMAGE}:0.4"
 docker push "${IMAGE}:latest"
 ```
 
@@ -154,7 +154,7 @@ docker login
 From the repository root:
 
 ```bash
-VERSION=0.3.0
+VERSION=0.4.1
 IMAGE=shellui/identity-service
 
 docker build -t "${IMAGE}:${VERSION}" .
@@ -165,13 +165,13 @@ docker push "${IMAGE}:${VERSION}"
 ### Build and push (amd64 + arm64)
 
 ```bash
-VERSION=0.3.0
+VERSION=0.4.1
 IMAGE=shellui/identity-service
 
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   -t "${IMAGE}:${VERSION}" \
-  -t "${IMAGE}:0.3" \
+  -t "${IMAGE}:0.4" \
   -t "${IMAGE}:latest" \
   --push .
 ```
@@ -200,7 +200,7 @@ docker run -d \
   -e JWT_PRIVATE_KEY='replace-with-pem-from-generate_jwt_keys' \
   -e ALLOWED_HOSTS='auth.example.com' \
   -e CSRF_TRUSTED_ORIGINS='https://auth.example.com,https://app.example.com' \
-  shellui/identity-service:0.3.0
+  shellui/identity-service:0.4.1
 ```
 
 With Postgres:

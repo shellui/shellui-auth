@@ -1,0 +1,1 @@
+"use strict";(self.webpackChunkidentity_service_docs=self.webpackChunkidentity_service_docs||[]).push([[647],{7121:(e,s,r)=>{r.r(s),r.d(s,{default:()=>a});r(6540);var c=r(4164),t=r(7559),i=r(5500),d=r(2831),n=r(6873),u=r(4848);function a(e){return(0,u.jsx)(i.e3,{className:(0,c.A)(t.G.wrapper.docsPages),children:(0,u.jsx)(n.A,{children:(0,d.v)(e.route.routes)})})}}}]);
